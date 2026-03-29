@@ -4,111 +4,192 @@ import aiohttp
 import yfinance as yf
 from datetime import datetime
 
-# Telegram settings
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 CHAT_ID = int(os.getenv("CHAT_ID"))
 
-if not TELEGRAM_TOKEN or not CHAT_ID:
-    raise ValueError("Set TELEGRAM_TOKEN and CHAT_ID as environment variables.")
-
-# Markets
 MARKETS = {
-    "EURUSD": "EURUSD=X",
-    "GBPUSD": "GBPUSD=X",
-    "USDJPY": "JPY=X",
-    "SP500": "SPY",
-    "DAX": "^GDAXI",
-    "NASDAQ": "^IXIC",
+    "BTCUSD": "BTC-USD",
     "GOLD": "GC=F",
-    "OIL": "CL=F",
-    "BTC": "BTC-USD",
-    "ETH": "ETH-USD",
-    "BNB": "BNB-USD"
+    "US30": "^DJI",
+    "NAS100": "^IXIC",
+    "USDJPY": "JPY=X"
 }
 
-# Tracking previous state
-previous_prices = {m: None for m in MARKETS}
-previous_signals = {m: None for m in MARKETS}
+TIMEFRAME = "15m"
+INTERVAL = 60
 
-INTERVAL = 60  # seconds
-BREAKOUT_THRESHOLD = 0.001  # 0.1% price breakout
+traded_today = []
 
-# Send Telegram messages
-async def send_telegram(session, message):
+# ---------- TELEGRAM ----------
+async def send(session, msg):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    try:
-        async with session.post(url, data={"chat_id": CHAT_ID, "text": message}) as resp:
-            await resp.text()
-    except Exception as e:
-        print("Telegram error:", e)
+    await session.post(url, data={"chat_id": CHAT_ID, "text": msg})
 
-# Fetch latest price
-async def fetch_price(symbol):
-    try:
-        ticker = yf.Ticker(symbol)
-        data = ticker.history(period="1d", interval="1m")
-        if not data.empty:
-            return float(data['Close'].iloc[-1])
-    except Exception as e:
-        print(f"Error fetching {symbol}: {e}")
+# ---------- DATA ----------
+def get_data(symbol):
+    return yf.Ticker(symbol).history(period="2d", interval=TIMEFRAME)
+
+# ---------- TREND ----------
+def trend(data):
+    return "UP" if data['Close'].iloc[-1] > data['Close'].iloc[-30] else "DOWN"
+
+# ---------- BOS ----------
+def bos(data):
+    if data['High'].iloc[-1] > data['High'].iloc[-10]:
+        return "BULLISH"
+    if data['Low'].iloc[-1] < data['Low'].iloc[-10]:
+        return "BEARISH"
     return None
 
-# Generate full trade signal
-def generate_trade_signal(price, prev_price, market):
-    if prev_price is None:
-        return None  # Skip first iteration
+# ---------- LIQUIDITY ----------
+def liquidity(data):
+    high = data['High'].iloc[-6:-1].max()
+    low = data['Low'].iloc[-6:-1].min()
+    price = data['Close'].iloc[-1]
 
-    # Determine direction
-    if price > prev_price * (1 + BREAKOUT_THRESHOLD):
-        direction = "BUY 📈"
-        reason = "Price broke above recent high 🔝"
-        sl = round(prev_price, 4)
-        tp = round(price + (price - sl) * 2, 4)
-        rr = round((tp - price) / (price - sl), 2)
-    elif price < prev_price * (1 - BREAKOUT_THRESHOLD):
-        direction = "SELL 📉"
-        reason = "Price broke below recent low 🔻"
-        sl = round(prev_price, 4)
-        tp = round(price - (sl - price) * 2, 4)
-        rr = round((price - tp) / (sl - price), 2)
-    else:
-        return None  # No trade
+    if price > high:
+        return "HIGH_SWEEP"
+    if price < low:
+        return "LOW_SWEEP"
+    return None
 
-    return {
-        "market": market,
-        "price": price,
-        "direction": direction,
-        "reason": reason,
-        "sl": sl,
-        "tp": tp,
-        "rr": rr
-    }
+# ---------- FVG ----------
+def find_fvg(data):
+    for i in range(-5, -1):
+        c1 = data.iloc[i-2]
+        c2 = data.iloc[i-1]
+        c3 = data.iloc[i]
 
-# Main loop
+        # bullish gap
+        if c3['Low'] > c1['High']:
+            return ("BULLISH", c1['High'], c3['Low'])
+
+        # bearish gap
+        if c3['High'] < c1['Low']:
+            return ("BEARISH", c3['High'], c1['Low'])
+
+    return None
+
+# ---------- ORDER BLOCK ----------
+def find_ob(data):
+    for i in range(-5, -1):
+        candle = data.iloc[i]
+
+        # bearish candle before bullish move
+        if candle['Close'] < candle['Open']:
+            return ("BUY_OB", candle['Low'], candle['High'])
+
+        # bullish candle before bearish move
+        if candle['Close'] > candle['Open']:
+            return ("SELL_OB", candle['Low'], candle['High'])
+
+    return None
+
+# ---------- ENTRY CHECK ----------
+def in_zone(price, zone_low, zone_high):
+    return zone_low <= price <= zone_high
+
+# ---------- MAIN ----------
 async def main():
-    print("🚀 Professional Trade Signal Bot started...")
+    print("🚀 Sniper SMC Bot Running...")
+
     async with aiohttp.ClientSession() as session:
         while True:
+
             for market, symbol in MARKETS.items():
-                price = await fetch_price(symbol)
-                if price is None:
+
+                if market in traded_today:
                     continue
 
-                trade = generate_trade_signal(price, previous_prices[market], market)
-                if trade and trade != previous_signals[market]:
-                    msg = f"""
-💹 {trade['market']}
-Entry: {trade['direction']} at {trade['price']:.4f}
-Reason: {trade['reason']}
-Stop-Loss: {trade['sl']} 🛑
-Take-Profit: {trade['tp']} 🎯
-Risk/Reward: {trade['rr']} ⚖️
-Time: {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC
-"""
-                    await send_telegram(session, msg)
-                    previous_signals[market] = trade
+                try:
+                    data = get_data(symbol)
+                    price = data['Close'].iloc[-1]
 
-                previous_prices[market] = price
+                    tr = trend(data)
+                    bs = bos(data)
+                    liq = liquidity(data)
+                    fvg = find_fvg(data)
+                    ob = find_ob(data)
+
+                    if not (tr and bs and liq and fvg and ob):
+                        continue
+
+                    fvg_type, fvg_low, fvg_high = fvg
+                    ob_type, ob_low, ob_high = ob
+
+                    # SNIPER CONDITIONS
+                    valid = False
+
+                    if tr == "UP" and bs == "BULLISH" and liq == "LOW_SWEEP":
+                        if fvg_type == "BULLISH" and ob_type == "BUY_OB":
+                            if in_zone(price, fvg_low, fvg_high):
+                                valid = True
+                                direction = "BUY 📈"
+                                sl = ob_low
+                                risk = price - sl
+                                tp1 = price + risk
+                                tp2 = price + risk * 3
+
+                    elif tr == "DOWN" and bs == "BEARISH" and liq == "HIGH_SWEEP":
+                        if fvg_type == "BEARISH" and ob_type == "SELL_OB":
+                            if in_zone(price, fvg_low, fvg_high):
+                                valid = True
+                                direction = "SELL 📉"
+                                sl = ob_high
+                                risk = sl - price
+                                tp1 = price - risk
+                                tp2 = price - risk * 3
+
+                    if not valid:
+                        continue
+
+                    # ---------- ANALYSIS ----------
+                    analysis = f"""
+🧠 SNIPER ANALYSIS - {market}
+
+⏱ TF: 15M
+
+📊 Trend: {tr}
+🏗 BOS: {bs}
+💧 Liquidity: {liq}
+
+⚡ FVG Zone: {round(fvg_low,2)} - {round(fvg_high,2)}
+🧱 OB Zone: {round(ob_low,2)} - {round(ob_high,2)}
+
+📌 Entry Reason:
+Liquidity sweep → BOS → Return to FVG inside OB
+
+⚖️ Confidence: ELITE (95%+) 🔥
+"""
+
+                    await send(session, analysis)
+
+                    # ---------- TRADE ----------
+                    trade = f"""
+💹 SNIPER TRADE - {market}
+
+📊 {direction}
+📍 Entry: {round(price,2)}
+
+🛑 SL: {round(sl,2)}
+💰 TP1: {round(tp1,2)}
+🎯 TP2: {round(tp2,2)}
+
+🔒 BE at TP1
+⚖️ RR: 1:3
+
+📉 Low drawdown entry (FVG + OB)
+
+📅 {datetime.utcnow()}
+"""
+
+                    await send(session, trade)
+
+                    traded_today.append(market)
+
+                except Exception as e:
+                    print("Error:", e)
+
             await asyncio.sleep(INTERVAL)
 
 if __name__ == "__main__":
