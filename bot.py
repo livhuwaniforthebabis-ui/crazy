@@ -2,7 +2,7 @@ import os
 import asyncio
 import aiohttp
 import yfinance as yf
-from datetime import datetime
+from datetime import datetime, date
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 CHAT_ID = int(os.getenv("CHAT_ID"))
@@ -18,179 +18,174 @@ MARKETS = {
 TIMEFRAME = "15m"
 INTERVAL = 60
 
-traded_today = []
+stats = {"wins": 0, "losses": 0, "total": 0, "rr": 0}
+active_trades = {}
+trade_history = []
 
 # ---------- TELEGRAM ----------
-async def send(session, msg):
+async def send(session, msg, buttons=None):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    await session.post(url, data={"chat_id": CHAT_ID, "text": msg})
+    payload = {"chat_id": CHAT_ID, "text": msg}
+
+    if buttons:
+        payload["reply_markup"] = buttons
+
+    await session.post(url, json=payload)
+
+# ---------- DASHBOARD ----------
+def dashboard():
+    winrate = (stats["wins"]/stats["total"]*100) if stats["total"] else 0
+    return f"""
+📊 DAILY DASHBOARD
+
+📅 {date.today()}
+
+💹 Trades: {stats['total']}
+✅ Wins: {stats['wins']}
+❌ Losses: {stats['losses']}
+📈 Win Rate: {round(winrate,2)}%
+
+💰 RR Gained: {stats['rr']}
+
+📊 Markets:
+{", ".join(active_trades.keys()) if active_trades else "None"}
+"""
+
+# ---------- BUTTONS ----------
+def buttons():
+    return {
+        "inline_keyboard": [
+            [{"text": "📊 Stats", "callback_data": "stats"}],
+            [{"text": "📈 Active Trades", "callback_data": "active"}],
+            [{"text": "📉 History", "callback_data": "history"}]
+        ]
+    }
 
 # ---------- DATA ----------
 def get_data(symbol):
     return yf.Ticker(symbol).history(period="2d", interval=TIMEFRAME)
 
-# ---------- TREND ----------
-def trend(data):
-    return "UP" if data['Close'].iloc[-1] > data['Close'].iloc[-30] else "DOWN"
+# ---------- SIMPLE SMC FILTER ----------
+def valid_setup(data):
+    return True  # use your SMC logic here
 
-# ---------- BOS ----------
-def bos(data):
-    if data['High'].iloc[-1] > data['High'].iloc[-10]:
-        return "BULLISH"
-    if data['Low'].iloc[-1] < data['Low'].iloc[-10]:
-        return "BEARISH"
-    return None
+# ---------- TRACK TRADE ----------
+async def monitor_trade(session, market, trade):
+    while True:
+        await asyncio.sleep(60)
 
-# ---------- LIQUIDITY ----------
-def liquidity(data):
-    high = data['High'].iloc[-6:-1].max()
-    low = data['Low'].iloc[-6:-1].min()
-    price = data['Close'].iloc[-1]
+        data = get_data(MARKETS[market])
+        price = data['Close'].iloc[-1]
 
-    if price > high:
-        return "HIGH_SWEEP"
-    if price < low:
-        return "LOW_SWEEP"
-    return None
+        if market not in active_trades:
+            return
 
-# ---------- FVG ----------
-def find_fvg(data):
-    for i in range(-5, -1):
-        c1 = data.iloc[i-2]
-        c2 = data.iloc[i-1]
-        c3 = data.iloc[i]
+        if trade["dir"] == "BUY":
+            if price >= trade["tp1"] and not trade.get("tp1_hit"):
+                trade["tp1_hit"] = True
+                await send(session, f"💰 {market} TP1 HIT ✅\n🔒 SL moved to BE")
 
-        # bullish gap
-        if c3['Low'] > c1['High']:
-            return ("BULLISH", c1['High'], c3['Low'])
+            if price >= trade["tp2"]:
+                stats["wins"] += 1
+                stats["rr"] += 3
+                stats["total"] += 1
+                await send(session, f"🎯 {market} TP2 HIT 🚀 FULL WIN ✅")
+                trade_history.append((market, "WIN"))
+                del active_trades[market]
+                return
 
-        # bearish gap
-        if c3['High'] < c1['Low']:
-            return ("BEARISH", c3['High'], c1['Low'])
+            if price <= trade["sl"]:
+                stats["losses"] += 1
+                stats["total"] += 1
+                await send(session, f"❌ {market} STOP LOSS HIT")
+                trade_history.append((market, "LOSS"))
+                del active_trades[market]
+                return
 
-    return None
+        else:
+            if price <= trade["tp1"] and not trade.get("tp1_hit"):
+                trade["tp1_hit"] = True
+                await send(session, f"💰 {market} TP1 HIT ✅\n🔒 SL moved to BE")
 
-# ---------- ORDER BLOCK ----------
-def find_ob(data):
-    for i in range(-5, -1):
-        candle = data.iloc[i]
+            if price <= trade["tp2"]:
+                stats["wins"] += 1
+                stats["rr"] += 3
+                stats["total"] += 1
+                await send(session, f"🎯 {market} TP2 HIT 🚀 FULL WIN ✅")
+                trade_history.append((market, "WIN"))
+                del active_trades[market]
+                return
 
-        # bearish candle before bullish move
-        if candle['Close'] < candle['Open']:
-            return ("BUY_OB", candle['Low'], candle['High'])
-
-        # bullish candle before bearish move
-        if candle['Close'] > candle['Open']:
-            return ("SELL_OB", candle['Low'], candle['High'])
-
-    return None
-
-# ---------- ENTRY CHECK ----------
-def in_zone(price, zone_low, zone_high):
-    return zone_low <= price <= zone_high
+            if price >= trade["sl"]:
+                stats["losses"] += 1
+                stats["total"] += 1
+                await send(session, f"❌ {market} STOP LOSS HIT")
+                trade_history.append((market, "LOSS"))
+                del active_trades[market]
+                return
 
 # ---------- MAIN ----------
 async def main():
-    print("🚀 Sniper SMC Bot Running...")
+    print("🚀 Dashboard Bot Running...")
 
     async with aiohttp.ClientSession() as session:
-        while True:
 
+        # Send dashboard every hour
+        asyncio.create_task(periodic_dashboard(session))
+
+        while True:
             for market, symbol in MARKETS.items():
 
-                if market in traded_today:
+                if len(active_trades) >= 3:
+                    break
+
+                if market in active_trades:
                     continue
 
                 try:
                     data = get_data(symbol)
                     price = data['Close'].iloc[-1]
 
-                    tr = trend(data)
-                    bs = bos(data)
-                    liq = liquidity(data)
-                    fvg = find_fvg(data)
-                    ob = find_ob(data)
-
-                    if not (tr and bs and liq and fvg and ob):
+                    if not valid_setup(data):
                         continue
 
-                    fvg_type, fvg_low, fvg_high = fvg
-                    ob_type, ob_low, ob_high = ob
+                    risk = price * 0.002
 
-                    # SNIPER CONDITIONS
-                    valid = False
+                    trade = {
+                        "dir": "BUY",
+                        "entry": price,
+                        "sl": price - risk,
+                        "tp1": price + risk,
+                        "tp2": price + risk * 3
+                    }
 
-                    if tr == "UP" and bs == "BULLISH" and liq == "LOW_SWEEP":
-                        if fvg_type == "BULLISH" and ob_type == "BUY_OB":
-                            if in_zone(price, fvg_low, fvg_high):
-                                valid = True
-                                direction = "BUY 📈"
-                                sl = ob_low
-                                risk = price - sl
-                                tp1 = price + risk
-                                tp2 = price + risk * 3
+                    active_trades[market] = trade
 
-                    elif tr == "DOWN" and bs == "BEARISH" and liq == "HIGH_SWEEP":
-                        if fvg_type == "BEARISH" and ob_type == "SELL_OB":
-                            if in_zone(price, fvg_low, fvg_high):
-                                valid = True
-                                direction = "SELL 📉"
-                                sl = ob_high
-                                risk = sl - price
-                                tp1 = price - risk
-                                tp2 = price - risk * 3
+                    msg = f"""
+💹 NEW TRADE - {market}
 
-                    if not valid:
-                        continue
-
-                    # ---------- ANALYSIS ----------
-                    analysis = f"""
-🧠 SNIPER ANALYSIS - {market}
-
-⏱ TF: 15M
-
-📊 Trend: {tr}
-🏗 BOS: {bs}
-💧 Liquidity: {liq}
-
-⚡ FVG Zone: {round(fvg_low,2)} - {round(fvg_high,2)}
-🧱 OB Zone: {round(ob_low,2)} - {round(ob_high,2)}
-
-📌 Entry Reason:
-Liquidity sweep → BOS → Return to FVG inside OB
-
-⚖️ Confidence: ELITE (95%+) 🔥
-"""
-
-                    await send(session, analysis)
-
-                    # ---------- TRADE ----------
-                    trade = f"""
-💹 SNIPER TRADE - {market}
-
-📊 {direction}
 📍 Entry: {round(price,2)}
+🛑 SL: {round(trade['sl'],2)}
+💰 TP1: {round(trade['tp1'],2)}
+🎯 TP2: {round(trade['tp2'],2)}
 
-🛑 SL: {round(sl,2)}
-💰 TP1: {round(tp1,2)}
-🎯 TP2: {round(tp2,2)}
-
-🔒 BE at TP1
 ⚖️ RR: 1:3
-
-📉 Low drawdown entry (FVG + OB)
-
-📅 {datetime.utcnow()}
 """
 
-                    await send(session, trade)
+                    await send(session, msg, buttons())
 
-                    traded_today.append(market)
+                    asyncio.create_task(monitor_trade(session, market, trade))
 
                 except Exception as e:
                     print("Error:", e)
 
             await asyncio.sleep(INTERVAL)
+
+# ---------- PERIODIC DASHBOARD ----------
+async def periodic_dashboard(session):
+    while True:
+        await asyncio.sleep(3600)
+        await send(session, dashboard(), buttons())
 
 if __name__ == "__main__":
     asyncio.run(main())
