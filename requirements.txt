@@ -1,4 +1,5 @@
-aiohttp==3.8.5
-yfinance==0.2.27
-pandas==2.1.1
-numpy==1.27.5
+aiohttp==3.8.5        # For async Telegram API requests
+yfinance==0.2.27      # To fetch market data (XAUUSD, US30, NAS100, USDJPY)
+pandas==2.1.1         # For OHLC data analysis
+numpy==1.27.5         # Required by pandas
+python-dotenv==1.0.0  # To load environment variables locally
