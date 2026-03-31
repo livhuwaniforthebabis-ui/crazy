@@ -25,12 +25,7 @@ PAIRS = {
 }
 
 MAX_TRADES_PER_DAY = 3
-CONFIDENCE_THRESHOLD = 80  # Higher for PRO setup
-
-TIMEFRAMES = {
-    "HTF": "4h",   # High timeframe for bias
-    "LTF": "5m"    # Entry timeframe
-}
+CONFIDENCE_THRESHOLD = 80
 
 # =========================
 # DATABASE
@@ -73,12 +68,10 @@ def fetch_data(symbol, interval, period="5d"):
 # PRO ICT/SMC STRATEGY
 # =========================
 def detect_bias(df_htf):
-    # Simple moving average bias for HTF
     sma = df_htf["Close"].rolling(50).mean()
     return "BUY" if df_htf["Close"].iloc[-1] > sma.iloc[-1] else "SELL"
 
 def detect_order_block(df):
-    # Detect last bullish/bearish candle before reversal (simplified)
     last_candle = df.iloc[-2]
     if last_candle['Close'] > last_candle['Open']:
         return ("bullish", last_candle['Low'])
@@ -86,13 +79,9 @@ def detect_order_block(df):
         return ("bearish", last_candle['High'])
 
 def detect_fvg(df):
-    # Fair value gap simplified: high of candle - low of 3rd candle
-    if df['High'].iloc[-3] < df['Low'].iloc[-1]:
-        return True
-    return False
+    return df['High'].iloc[-3] < df['Low'].iloc[-1]
 
 def detect_bos(df_ltf):
-    # Break of structure simplified
     highs = df_ltf['High'][-5:]
     lows = df_ltf['Low'][-5:]
     return df_ltf['Close'].iloc[-1] > max(highs) or df_ltf['Close'].iloc[-1] < min(lows)
