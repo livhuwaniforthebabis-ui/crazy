@@ -1,292 +1,193 @@
 import os
-import sqlite3
-import random
+import asyncio
+import aiohttp
 import yfinance as yf
-import pandas as pd
-from telegram import Bot, Update
-from telegram.ext import Updater, CommandHandler, CallbackContext
+from datetime import date, datetime
 
-# =========================
-# ENV VARIABLES
-# =========================
+# ---------------- CONFIG ----------------
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+CHAT_ID = int(os.getenv("CHAT_ID"))
 
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-CHAT_ID = os.getenv("CHAT_ID")
-
-# =========================
-# SETTINGS
-# =========================
-
-PAIRS = {
-    "XAUUSD": "GC=F",
+MARKETS = {
+    "XAUUSD": "XAUUSD=X",
     "US30": "^DJI",
     "NAS100": "^NDX",
     "USDJPY": "JPY=X"
 }
 
-MAX_TRADES_PER_DAY = 3
-CONFIDENCE_THRESHOLD = 70
+TIMEFRAME = "15m"        # Execution timeframe
+ANALYSIS_HFT = "1d"      # High timeframe bias
+INTERVAL = 60             # Loop interval
 
-# =========================
-# DATABASE
-# =========================
+# ---------------- STATE ----------------
+stats = {"wins":0,"losses":0,"total":0,"rr":0}
+active_trades = {}
+trade_history = []
 
-conn = sqlite3.connect("trades.db", check_same_thread=False)
-cursor = conn.cursor()
+# ---------------- TELEGRAM ----------------
+async def send(session, msg, buttons=None):
+    url=f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    payload={"chat_id":CHAT_ID,"text":msg}
+    if buttons:
+        payload["reply_markup"]=buttons
+    await session.post(url,json=payload)
 
-cursor.execute("""
-CREATE TABLE IF NOT EXISTS trades(
-id INTEGER PRIMARY KEY AUTOINCREMENT,
-pair TEXT,
-result TEXT
-)
-""")
+def buttons():
+    return {"inline_keyboard":[
+        [{"text":"📊 Stats","callback_data":"stats"}],
+        [{"text":"📈 Active Trades","callback_data":"active"}],
+        [{"text":"📉 History","callback_data":"history"}]
+    ]}
 
-conn.commit()
+# ---------------- DASHBOARD ----------------
+def dashboard():
+    winrate=(stats["wins"]/stats["total"]*100) if stats["total"] else 0
+    return f"""
+📊 VIP DASHBOARD
 
-# =========================
-# TELEGRAM
-# =========================
+📅 {date.today()}
 
-bot = Bot(token=BOT_TOKEN)
-
-# =========================
-# MARKET DATA
-# =========================
-
-def fetch_data(symbol):
-
-    df = yf.download(
-        symbol,
-        interval="5m",
-        period="5d",
-        progress=False
-    )
-
-    return df
-
-# =========================
-# STRATEGY ENGINE
-# =========================
-
-def detect_bias(df):
-
-    sma = df["Close"].rolling(50).mean()
-
-    if df["Close"].iloc[-1] > sma.iloc[-1]:
-        return "BUY"
-
-    return "SELL"
-
-
-def detect_liquidity_sweep(df):
-
-    recent_low = df["Low"].iloc[-1]
-    prev_low = df["Low"].iloc[-5:-1].min()
-
-    if recent_low < prev_low:
-        return True
-
-    return False
-
-
-def detect_fvg(df):
-
-    if df["High"].iloc[-3] < df["Low"].iloc[-1]:
-        return True
-
-    return False
-
-
-def generate_signal(df):
-
-    bias = detect_bias(df)
-    sweep = detect_liquidity_sweep(df)
-    fvg = detect_fvg(df)
-
-    confidence = 0
-
-    if bias:
-        confidence += 30
-
-    if sweep:
-        confidence += 40
-
-    if fvg:
-        confidence += 30
-
-    if confidence < CONFIDENCE_THRESHOLD:
-        return None
-
-    price = float(df["Close"].iloc[-1])
-
-    if bias == "BUY":
-
-        sl = price - random.uniform(5,10)
-        tp1 = price + random.uniform(8,12)
-        tp2 = price + random.uniform(20,30)
-
-    else:
-
-        sl = price + random.uniform(5,10)
-        tp1 = price - random.uniform(8,12)
-        tp2 = price - random.uniform(20,30)
-
-    return {
-        "type": bias,
-        "entry": round(price,2),
-        "sl": round(sl,2),
-        "tp1": round(tp1,2),
-        "tp2": round(tp2,2),
-        "confidence": confidence,
-        "reason": "Liquidity sweep + Fair Value Gap + HTF bias"
-    }
-
-# =========================
-# SIGNAL MESSAGES
-# =========================
-
-def send_analysis(pair, signal):
-
-    message = f"""
-📊 MARKET ANALYSIS — {pair}
-
-Bias: {signal['type']}
-
-Reason For Setup:
-
-• Liquidity sweep detected
-• Fair Value Gap entry
-• Higher timeframe bias aligned
-
-Confidence:
-{signal['confidence']}%
-
-Timeframes Used:
-
-HTF: Daily / 4H
-Confirmation: 1H
-Entry: 5M
-
-Risk Per Trade:
-1%
+💹 Trades Today: {stats['total']}
+✅ Wins: {stats['wins']}
+❌ Losses: {stats['losses']}
+📈 Win Rate: {round(winrate,2)}%
+💰 Total RR: {stats['rr']}
+📊 Active: {', '.join(active_trades.keys()) if active_trades else 'None'}
 """
 
-    bot.send_message(chat_id=CHAT_ID, text=message)
+# ---------------- DATA ----------------
+def get_data(symbol, period="2d"):
+    return yf.Ticker(symbol).history(period=period, interval=TIMEFRAME)
 
+def get_hft_bias(symbol):
+    data=yf.Ticker(symbol).history(period="30d", interval=ANALYSIS_HFT)
+    if data.empty: return None
+    return "BUY" if data['Close'].iloc[-1]>data['Close'].iloc[-2] else "SELL"
 
-def send_trade(pair, signal):
+# ---------------- STRUCTURE ----------------
+def bos(data):
+    if data['High'].iloc[-1]>data['High'].iloc[-10]:
+        return "BULLISH"
+    if data['Low'].iloc[-1]<data['Low'].iloc[-10]:
+        return "BEARISH"
+    return None
 
-    message = f"""
-🚀 TRADE SETUP — {pair}
+def liquidity(data):
+    high=data['High'].iloc[-6:-1].max()
+    low=data['Low'].iloc[-6:-1].min()
+    price=data['Close'].iloc[-1]
+    if price>high: return "HIGH_SWEEP"
+    if price<low: return "LOW_SWEEP"
+    return None
 
-Type: {signal['type']}
+# ---------------- TRADE MONITOR ----------------
+async def monitor_trade(session,market,trade):
+    while True:
+        await asyncio.sleep(60)
+        data=get_data(MARKETS[market])
+        if data.empty: continue
+        price=data['Close'].iloc[-1]
+        if market not in active_trades: return
 
-Entry:
-{signal['entry']}
+        if trade["dir"]=="BUY":
+            if price>=trade["tp1"] and not trade.get("tp1_hit"):
+                trade["tp1_hit"]=True
+                await send(session,f"💰 {market} TP1 HIT ✅\n🔒 SL moved to BE")
+            if price>=trade["tp2"]:
+                stats["wins"]+=1; stats["rr"]+=3; stats["total"]+=1
+                await send(session,f"🎯 {market} TP2 HIT 🚀 WIN")
+                trade_history.append((market,"WIN")); del active_trades[market]; return
+            if price<=trade["sl"]:
+                stats["losses"]+=1; stats["total"]+=1
+                await send(session,f"❌ {market} SL HIT")
+                trade_history.append((market,"LOSS")); del active_trades[market]; return
+        else:
+            if price<=trade["tp1"] and not trade.get("tp1_hit"):
+                trade["tp1_hit"]=True
+                await send(session,f"💰 {market} TP1 HIT ✅\n🔒 SL moved to BE")
+            if price<=trade["tp2"]:
+                stats["wins"]+=1; stats["rr"]+=3; stats["total"]+=1
+                await send(session,f"🎯 {market} TP2 HIT 🚀 WIN")
+                trade_history.append((market,"WIN")); del active_trades[market]; return
+            if price>=trade["sl"]:
+                stats["losses"]+=1; stats["total"]+=1
+                await send(session,f"❌ {market} SL HIT")
+                trade_history.append((market,"LOSS")); del active_trades[market]; return
 
-Stop Loss:
-{signal['sl']}
+# ---------------- CALLBACK ----------------
+async def handle_callbacks(session):
+    offset=None
+    while True:
+        url=f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates?timeout=60"
+        if offset: url+=f"&offset={offset}"
+        async with session.get(url) as resp:
+            updates=await resp.json()
+        for update in updates.get("result",[]):
+            offset=update["update_id"]+1
+            if "callback_query" in update:
+                cmd=update["callback_query"]["data"]
+                if cmd=="stats": await send(session,dashboard())
+                elif cmd=="active":
+                    msg="📈 ACTIVE TRADES\n"
+                    for m,t in active_trades.items(): msg+=f"{m}: {t['dir']} @ {round(t['entry'],2)}\n"
+                    if not active_trades: msg+="None"
+                    await send(session,msg)
+                elif cmd=="history":
+                    msg="📉 HISTORY\n"
+                    for h in trade_history: msg+=f"{h[0]} - {h[1]}\n"
+                    if not trade_history: msg+="No trades yet"
+                    await send(session,msg)
 
-Take Profit 1:
-{signal['tp1']}
+# ---------------- MAIN ----------------
+async def main():
+    print("🚀 VIP SIGNAL BOT RUNNING")
+    async with aiohttp.ClientSession() as session:
+        asyncio.create_task(handle_callbacks(session))
 
-Take Profit 2:
-{signal['tp2']}
+        while True:
+            for market,symbol in MARKETS.items():
+                if len(active_trades)>=3: break
+                if market in active_trades: continue
+                try:
+                    data=get_data(symbol)
+                    if data.empty: continue
+                    price=data['Close'].iloc[-1]
+                    hft_bias=get_hft_bias(symbol)
+                    structure=bos(data)
+                    liq=liquidity(data)
+                    direction=None
+                    if structure=="BULLISH" and liq=="LOW_SWEEP": direction="BUY"
+                    elif structure=="BEARISH" and liq=="HIGH_SWEEP": direction="SELL"
+                    if direction is None: continue
 
-Management Plan:
+                    # ---------------- ANALYSIS MESSAGE ----------------
+                    analysis=f"""
+💹 NEW VIP TRADE - {market}
 
-TP1 → Move SL to Break Even  
-TP2 → Close remaining position
+📊 Direction: {direction}
+📍 Entry: {round(price,2)}
+⚖️ HFT Bias: {hft_bias}
+🕒 Analyzed TF: {ANALYSIS_HFT}
+⏱️ Execution TF: {TIMEFRAME}
+
+🔎 Reason: {'Bullish structure & liquidity sweep' if direction=='BUY' else 'Bearish structure & liquidity sweep'}
+💡 Confidence: 80%
+💰 Risk Management: 0.2% risk per trade
 """
 
-    bot.send_message(chat_id=CHAT_ID, text=message)
+                    # ---------------- SET SL/TP ----------------
+                    risk=price*0.002
+                    if direction=="BUY":
+                        trade={"dir":"BUY","entry":price,"sl":price-risk,"tp1":price+risk,"tp2":price+risk*3}
+                    else:
+                        trade={"dir":"SELL","entry":price,"sl":price+risk,"tp1":price-risk,"tp2":price-risk*3}
 
+                    active_trades[market]=trade
+                    await send(session,analysis,buttons())
+                    asyncio.create_task(monitor_trade(session,market,trade))
 
-# =========================
-# MARKET SCANNER
-# =========================
+                except Exception as e: print("Error:",e)
+            await asyncio.sleep(INTERVAL)
 
-def scan_markets():
-
-    trades_today = 0
-
-    for pair, symbol in PAIRS.items():
-
-        if trades_today >= MAX_TRADES_PER_DAY:
-            break
-
-        df = fetch_data(symbol)
-
-        if df.empty:
-            continue
-
-        signal = generate_signal(df)
-
-        if signal:
-
-            send_analysis(pair, signal)
-            send_trade(pair, signal)
-
-            trades_today += 1
-
-
-# =========================
-# DASHBOARD COMMAND
-# =========================
-
-def dashboard(update: Update, context: CallbackContext):
-
-    cursor.execute("SELECT COUNT(*) FROM trades")
-    total = cursor.fetchone()[0]
-
-    cursor.execute("SELECT COUNT(*) FROM trades WHERE result='win'")
-    wins = cursor.fetchone()[0]
-
-    losses = total - wins
-
-    if total > 0:
-        winrate = round((wins / total) * 100,2)
-    else:
-        winrate = 0
-
-    message = f"""
-📊 VIP SIGNAL DASHBOARD
-
-Total Trades:
-{total}
-
-Wins:
-{wins}
-
-Losses:
-{losses}
-
-Win Rate:
-{winrate}%
-"""
-
-    update.message.reply_text(message)
-
-
-# =========================
-# START BOT
-# =========================
-
-def main():
-
-    updater = Updater(BOT_TOKEN, use_context=True)
-
-    dp = updater.dispatcher
-
-    dp.add_handler(CommandHandler("dashboard", dashboard))
-
-    updater.start_polling()
-
-    scan_markets()
-
-    updater.idle()
-
-
-if __name__ == "__main__":
-    main()
+if __name__=="__main__":
+    asyncio.run(main())
