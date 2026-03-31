@@ -1,2 +1,4 @@
-yfinance
-aiohttp
+aiohttp==3.8.5
+yfinance==0.2.27
+pandas==2.1.1
+numpy==1.27.5
