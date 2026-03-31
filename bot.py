@@ -1,22 +1,22 @@
 import os
 import sqlite3
 import random
-import yfinance as yf
+import datetime
 import pandas as pd
+import yfinance as yf
 from telegram import Bot, Update
 from telegram.ext import Updater, CommandHandler, CallbackContext
+from apscheduler.schedulers.background import BackgroundScheduler
 
 # =========================
 # ENV VARIABLES
 # =========================
-
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
 
 # =========================
 # SETTINGS
 # =========================
-
 PAIRS = {
     "XAUUSD": "GC=F",
     "US30": "^DJI",
@@ -25,12 +25,16 @@ PAIRS = {
 }
 
 MAX_TRADES_PER_DAY = 3
-CONFIDENCE_THRESHOLD = 70
+CONFIDENCE_THRESHOLD = 80  # Higher for PRO setup
+
+TIMEFRAMES = {
+    "HTF": "4h",   # High timeframe for bias
+    "LTF": "5m"    # Entry timeframe
+}
 
 # =========================
 # DATABASE
 # =========================
-
 conn = sqlite3.connect("trades.db", check_same_thread=False)
 cursor = conn.cursor()
 
@@ -41,93 +45,89 @@ pair TEXT,
 result TEXT
 )
 """)
-
 conn.commit()
 
 # =========================
 # TELEGRAM
 # =========================
-
 bot = Bot(token=BOT_TOKEN)
+
+# =========================
+# GLOBAL VARIABLES
+# =========================
+trades_today = 0
+last_scan_day = datetime.date.today()
 
 # =========================
 # MARKET DATA
 # =========================
-
-def fetch_data(symbol):
-
-    df = yf.download(
-        symbol,
-        interval="5m",
-        period="5d",
-        progress=False
-    )
-
-    return df
+def fetch_data(symbol, interval, period="5d"):
+    try:
+        df = yf.download(symbol, interval=interval, period=period, progress=False)
+        return df
+    except Exception as e:
+        print(f"[ERROR] Fetching data for {symbol} ({interval}): {e}")
+        return None
 
 # =========================
-# STRATEGY ENGINE
+# PRO ICT/SMC STRATEGY
 # =========================
+def detect_bias(df_htf):
+    # Simple moving average bias for HTF
+    sma = df_htf["Close"].rolling(50).mean()
+    return "BUY" if df_htf["Close"].iloc[-1] > sma.iloc[-1] else "SELL"
 
-def detect_bias(df):
-
-    sma = df["Close"].rolling(50).mean()
-
-    if df["Close"].iloc[-1] > sma.iloc[-1]:
-        return "BUY"
-
-    return "SELL"
-
-
-def detect_liquidity_sweep(df):
-
-    recent_low = df["Low"].iloc[-1]
-    prev_low = df["Low"].iloc[-5:-1].min()
-
-    if recent_low < prev_low:
-        return True
-
-    return False
-
+def detect_order_block(df):
+    # Detect last bullish/bearish candle before reversal (simplified)
+    last_candle = df.iloc[-2]
+    if last_candle['Close'] > last_candle['Open']:
+        return ("bullish", last_candle['Low'])
+    else:
+        return ("bearish", last_candle['High'])
 
 def detect_fvg(df):
-
-    if df["High"].iloc[-3] < df["Low"].iloc[-1]:
+    # Fair value gap simplified: high of candle - low of 3rd candle
+    if df['High'].iloc[-3] < df['Low'].iloc[-1]:
         return True
-
     return False
 
+def detect_bos(df_ltf):
+    # Break of structure simplified
+    highs = df_ltf['High'][-5:]
+    lows = df_ltf['Low'][-5:]
+    return df_ltf['Close'].iloc[-1] > max(highs) or df_ltf['Close'].iloc[-1] < min(lows)
 
-def generate_signal(df):
+def detect_liquidity_sweep(df_ltf):
+    recent_low = df_ltf["Low"].iloc[-1]
+    prev_low = df_ltf["Low"].iloc[-5:-1].min()
+    recent_high = df_ltf["High"].iloc[-1]
+    prev_high = df_ltf["High"].iloc[-5:-1].max()
+    return recent_low < prev_low or recent_high > prev_high
 
-    bias = detect_bias(df)
-    sweep = detect_liquidity_sweep(df)
-    fvg = detect_fvg(df)
+def generate_signal(df_htf, df_ltf):
+    bias = detect_bias(df_htf)
+    ob_type, ob_level = detect_order_block(df_ltf)
+    fvg = detect_fvg(df_ltf)
+    bos = detect_bos(df_ltf)
+    sweep = detect_liquidity_sweep(df_ltf)
 
     confidence = 0
-
-    if bias:
-        confidence += 30
-
-    if sweep:
-        confidence += 40
-
-    if fvg:
-        confidence += 30
+    if bias: confidence += 25
+    if ob_type: confidence += 25
+    if fvg: confidence += 25
+    if bos: confidence += 15
+    if sweep: confidence += 10
 
     if confidence < CONFIDENCE_THRESHOLD:
         return None
 
-    price = float(df["Close"].iloc[-1])
+    price = float(df_ltf["Close"].iloc[-1])
 
     if bias == "BUY":
-
         sl = price - random.uniform(5,10)
         tp1 = price + random.uniform(8,12)
         tp2 = price + random.uniform(20,30)
-
     else:
-
         sl = price + random.uniform(5,10)
         tp1 = price - random.uniform(8,12)
         tp2 = price - random.uniform(20,30)
@@ -139,154 +139,118 @@ def generate_signal(df):
         "tp1": round(tp1,2),
         "tp2": round(tp2,2),
         "confidence": confidence,
-        "reason": "Liquidity sweep + Fair Value Gap + HTF bias"
+        "reason": f"OB: {ob_type}, FVG: {fvg}, BOS: {bos}, Liquidity Sweep: {sweep}"
     }
 
 # =========================
-# SIGNAL MESSAGES
+# TELEGRAM MESSAGES
 # =========================
-
 def send_analysis(pair, signal):
-
     message = f"""
 📊 MARKET ANALYSIS — {pair}
 
 Bias: {signal['type']}
 
 Reason For Setup:
+{signal['reason']}
 
-• Liquidity sweep detected
-• Fair Value Gap entry
-• Higher timeframe bias aligned
-
-Confidence:
-{signal['confidence']}%
+Confidence: {signal['confidence']}%
 
 Timeframes Used:
-
-HTF: Daily / 4H
-Confirmation: 1H
+HTF: 4H / Daily
 Entry: 5M
 
-Risk Per Trade:
-1%
+Risk Per Trade: 1%
 """
-
-    bot.send_message(chat_id=CHAT_ID, text=message)
-
+    try:
+        bot.send_message(chat_id=CHAT_ID, text=message)
+    except Exception as e:
+        print(f"[ERROR] Sending analysis: {e}")
 
 def send_trade(pair, signal):
-
     message = f"""
 🚀 TRADE SETUP — {pair}
 
 Type: {signal['type']}
-
-Entry:
-{signal['entry']}
-
-Stop Loss:
-{signal['sl']}
-
-Take Profit 1:
-{signal['tp1']}
-
-Take Profit 2:
-{signal['tp2']}
+Entry: {signal['entry']}
+SL: {signal['sl']}
+TP1: {signal['tp1']}
+TP2: {signal['tp2']}
 
 Management Plan:
-
-TP1 → Move SL to Break Even  
+TP1 → Move SL to Break Even
 TP2 → Close remaining position
 """
-
-    bot.send_message(chat_id=CHAT_ID, text=message)
-
-
-# =========================
-# MARKET SCANNER
-# =========================
-
-def scan_markets():
-
-    trades_today = 0
-
-    for pair, symbol in PAIRS.items():
-
-        if trades_today >= MAX_TRADES_PER_DAY:
-            break
-
-        df = fetch_data(symbol)
-
-        if df.empty:
-            continue
-
-        signal = generate_signal(df)
-
-        if signal:
-
-            send_analysis(pair, signal)
-            send_trade(pair, signal)
-
-            trades_today += 1
-
+    try:
+        bot.send_message(chat_id=CHAT_ID, text=message)
+    except Exception as e:
+        print(f"[ERROR] Sending trade: {e}")
 
 # =========================
-# DASHBOARD COMMAND
+# DASHBOARD
 # =========================
-
 def dashboard(update: Update, context: CallbackContext):
-
     cursor.execute("SELECT COUNT(*) FROM trades")
     total = cursor.fetchone()[0]
-
     cursor.execute("SELECT COUNT(*) FROM trades WHERE result='win'")
     wins = cursor.fetchone()[0]
-
     losses = total - wins
-
-    if total > 0:
-        winrate = round((wins / total) * 100,2)
-    else:
-        winrate = 0
-
+    winrate = round((wins / total) * 100,2) if total > 0 else 0
     message = f"""
 📊 VIP SIGNAL DASHBOARD
 
-Total Trades:
-{total}
-
-Wins:
-{wins}
-
-Losses:
-{losses}
-
-Win Rate:
-{winrate}%
+Total Trades: {total}
+Wins: {wins}
+Losses: {losses}
+Win Rate: {winrate}%
 """
-
     update.message.reply_text(message)
 
+# =========================
+# SCHEDULED SCAN
+# =========================
+def scheduled_scan():
+    global trades_today, last_scan_day
+    try:
+        today = datetime.date.today()
+        if today != last_scan_day:
+            trades_today = 0
+            last_scan_day = today
+
+        for pair, symbol in PAIRS.items():
+            if trades_today >= MAX_TRADES_PER_DAY:
+                break
+
+            df_htf = fetch_data(symbol, interval="4h")
+            df_ltf = fetch_data(symbol, interval="5m")
+            if df_htf is None or df_ltf is None or df_htf.empty or df_ltf.empty:
+                continue
+
+            signal = generate_signal(df_htf, df_ltf)
+            if signal:
+                send_analysis(pair, signal)
+                send_trade(pair, signal)
+                trades_today += 1
+
+    except Exception as e:
+        print(f"[ERROR] Scheduled scan failed: {e}")
 
 # =========================
-# START BOT
+# MAIN
 # =========================
-
 def main():
-
     updater = Updater(BOT_TOKEN, use_context=True)
-
     dp = updater.dispatcher
-
     dp.add_handler(CommandHandler("dashboard", dashboard))
 
+    scheduler = BackgroundScheduler()
+    scheduler.add_job(scheduled_scan, 'interval', minutes=15)
+    scheduler.start()
+    print("Scheduler started: scanning every 15 minutes")
+
     updater.start_polling()
-
-    scan_markets()
-
+    print("Bot is running...")
     updater.idle()
-
 
 if __name__ == "__main__":
     main()
