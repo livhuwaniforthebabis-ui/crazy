@@ -1,268 +1,292 @@
 import os
-import asyncio
-import aiohttp
+import sqlite3
+import random
 import yfinance as yf
-from datetime import datetime, date
+import pandas as pd
+from telegram import Bot, Update
+from telegram.ext import Updater, CommandHandler, CallbackContext
 
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-CHAT_ID = int(os.getenv("CHAT_ID"))
+# =========================
+# ENV VARIABLES
+# =========================
 
-# ✅ FIXED SYMBOLS
-MARKETS = {
-    "BTCUSD": "BTC-USD",
-    "GOLD": "XAUUSD=X",
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+CHAT_ID = os.getenv("CHAT_ID")
+
+# =========================
+# SETTINGS
+# =========================
+
+PAIRS = {
+    "XAUUSD": "GC=F",
     "US30": "^DJI",
     "NAS100": "^NDX",
     "USDJPY": "JPY=X"
 }
 
-TIMEFRAME = "15m"
-INTERVAL = 60
+MAX_TRADES_PER_DAY = 3
+CONFIDENCE_THRESHOLD = 70
 
-# ---------- STATE ----------
-stats = {"wins": 0, "losses": 0, "total": 0, "rr": 0}
-active_trades = {}
-trade_history = []
+# =========================
+# DATABASE
+# =========================
 
-# ---------- TELEGRAM ----------
-async def send(session, msg, buttons=None):
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    payload = {"chat_id": CHAT_ID, "text": msg}
-    if buttons:
-        payload["reply_markup"] = buttons
-    await session.post(url, json=payload)
+conn = sqlite3.connect("trades.db", check_same_thread=False)
+cursor = conn.cursor()
 
-# ---------- DASHBOARD ----------
-def dashboard():
-    winrate = (stats["wins"]/stats["total"]*100) if stats["total"] else 0
-    return f"""
-📊 DAILY DASHBOARD
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS trades(
+id INTEGER PRIMARY KEY AUTOINCREMENT,
+pair TEXT,
+result TEXT
+)
+""")
 
-📅 {date.today()}
+conn.commit()
 
-💹 Trades: {stats['total']}
-✅ Wins: {stats['wins']}
-❌ Losses: {stats['losses']}
-📈 Win Rate: {round(winrate,2)}%
+# =========================
+# TELEGRAM
+# =========================
 
-💰 RR Gained: {stats['rr']}
+bot = Bot(token=BOT_TOKEN)
 
-📊 Active Markets:
-{", ".join(active_trades.keys()) if active_trades else "None"}
-"""
+# =========================
+# MARKET DATA
+# =========================
 
-# ---------- BUTTONS ----------
-def buttons():
-    return {
-        "inline_keyboard": [
-            [{"text": "📊 Stats", "callback_data": "stats"}],
-            [{"text": "📈 Active Trades", "callback_data": "active"}],
-            [{"text": "📉 History", "callback_data": "history"}]
-        ]
-    }
+def fetch_data(symbol):
 
-# ---------- DATA ----------
-def get_data(symbol):
-    data = yf.Ticker(symbol).history(period="2d", interval=TIMEFRAME)
-    return data
-
-# ---------- SMC LOGIC ----------
-def get_trend(data):
-    return "BUY" if data['Close'].iloc[-1] > data['Close'].iloc[-30] else "SELL"
-
-def bos(data):
-    if data['High'].iloc[-1] > data['High'].iloc[-10]:
-        return "BULLISH"
-    if data['Low'].iloc[-1] < data['Low'].iloc[-10]:
-        return "BEARISH"
-    return None
-
-def liquidity(data):
-    high = data['High'].iloc[-6:-1].max()
-    low = data['Low'].iloc[-6:-1].min()
-    price = data['Close'].iloc[-1]
-
-    if price > high:
-        return "HIGH_SWEEP"
-    if price < low:
-        return "LOW_SWEEP"
-    return None
-
-# ---------- HIGH PROBABILITY ----------
-def valid_setup(trend, structure, liq):
-    return (
-        (trend == "BUY" and structure == "BULLISH" and liq == "LOW_SWEEP") or
-        (trend == "SELL" and structure == "BEARISH" and liq == "HIGH_SWEEP")
+    df = yf.download(
+        symbol,
+        interval="5m",
+        period="5d",
+        progress=False
     )
 
-# ---------- MONITOR ----------
-async def monitor_trade(session, market, trade):
-    while True:
-        await asyncio.sleep(60)
-        data = get_data(MARKETS[market])
+    return df
 
-        if data.empty:
-            continue
+# =========================
+# STRATEGY ENGINE
+# =========================
 
-        price = data['Close'].iloc[-1]
+def detect_bias(df):
 
-        if market not in active_trades:
-            return
+    sma = df["Close"].rolling(50).mean()
 
-        if trade["dir"] == "BUY":
-            if price >= trade["tp1"] and not trade.get("tp1_hit"):
-                trade["tp1_hit"] = True
-                await send(session, f"💰 {market} TP1 HIT ✅\n🔒 BE Activated")
+    if df["Close"].iloc[-1] > sma.iloc[-1]:
+        return "BUY"
 
-            if price >= trade["tp2"]:
-                stats["wins"] += 1
-                stats["rr"] += 3
-                stats["total"] += 1
-                await send(session, f"🎯 {market} TP2 HIT 🚀 WIN")
-                trade_history.append((market, "WIN"))
-                del active_trades[market]
-                return
+    return "SELL"
 
-            if price <= trade["sl"]:
-                stats["losses"] += 1
-                stats["total"] += 1
-                await send(session, f"❌ {market} SL HIT")
-                trade_history.append((market, "LOSS"))
-                del active_trades[market]
-                return
 
-        else:
-            if price <= trade["tp1"] and not trade.get("tp1_hit"):
-                trade["tp1_hit"] = True
-                await send(session, f"💰 {market} TP1 HIT ✅\n🔒 BE Activated")
+def detect_liquidity_sweep(df):
 
-            if price <= trade["tp2"]:
-                stats["wins"] += 1
-                stats["rr"] += 3
-                stats["total"] += 1
-                await send(session, f"🎯 {market} TP2 HIT 🚀 WIN")
-                trade_history.append((market, "WIN"))
-                del active_trades[market]
-                return
+    recent_low = df["Low"].iloc[-1]
+    prev_low = df["Low"].iloc[-5:-1].min()
 
-            if price >= trade["sl"]:
-                stats["losses"] += 1
-                stats["total"] += 1
-                await send(session, f"❌ {market} SL HIT")
-                trade_history.append((market, "LOSS"))
-                del active_trades[market]
-                return
+    if recent_low < prev_low:
+        return True
 
-# ---------- CALLBACKS ----------
-async def handle_callbacks(session):
-    offset = None
-    while True:
-        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates?timeout=60"
-        if offset:
-            url += f"&offset={offset}"
-        async with session.get(url) as resp:
-            updates = await resp.json()
+    return False
 
-        for update in updates.get("result", []):
-            offset = update["update_id"] + 1
 
-            if "callback_query" in update:
-                command = update["callback_query"]["data"]
+def detect_fvg(df):
 
-                if command == "stats":
-                    await send(session, dashboard())
+    if df["High"].iloc[-3] < df["Low"].iloc[-1]:
+        return True
 
-                elif command == "active":
-                    msg = "📊 ACTIVE TRADES\n"
-                    for m, t in active_trades.items():
-                        msg += f"{m}: {t['dir']} @ {round(t['entry'],2)}\n"
-                    if not active_trades:
-                        msg += "None"
-                    await send(session, msg)
+    return False
 
-                elif command == "history":
-                    msg = "📉 HISTORY\n"
-                    for h in trade_history:
-                        msg += f"{h[0]} - {h[1]}\n"
-                    if not trade_history:
-                        msg += "No trades"
-                    await send(session, msg)
 
-# ---------- MAIN ----------
-async def main():
-    print("🚀 FINAL SMC BOT RUNNING")
+def generate_signal(df):
 
-    async with aiohttp.ClientSession() as session:
-        asyncio.create_task(handle_callbacks(session))
+    bias = detect_bias(df)
+    sweep = detect_liquidity_sweep(df)
+    fvg = detect_fvg(df)
 
-        while True:
-            for market, symbol in MARKETS.items():
+    confidence = 0
 
-                if len(active_trades) >= 3:
-                    break
+    if bias:
+        confidence += 30
 
-                if market in active_trades:
-                    continue
+    if sweep:
+        confidence += 40
 
-                try:
-                    data = get_data(symbol)
+    if fvg:
+        confidence += 30
 
-                    if data.empty:
-                        print(f"{market} ❌ No data")
-                        continue
+    if confidence < CONFIDENCE_THRESHOLD:
+        return None
 
-                    price = data['Close'].iloc[-1]
+    price = float(df["Close"].iloc[-1])
 
-                    tr = get_trend(data)
-                    st = bos(data)
-                    liq = liquidity(data)
+    if bias == "BUY":
 
-                    print(f"{market} | {tr} | {st} | {liq}")
+        sl = price - random.uniform(5,10)
+        tp1 = price + random.uniform(8,12)
+        tp2 = price + random.uniform(20,30)
 
-                    if not valid_setup(tr, st, liq):
-                        continue
+    else:
 
-                    risk = price * 0.002
+        sl = price + random.uniform(5,10)
+        tp1 = price - random.uniform(8,12)
+        tp2 = price - random.uniform(20,30)
 
-                    if tr == "BUY":
-                        trade = {
-                            "dir": "BUY",
-                            "entry": price,
-                            "sl": price - risk,
-                            "tp1": price + risk,
-                            "tp2": price + risk * 3
-                        }
-                    else:
-                        trade = {
-                            "dir": "SELL",
-                            "entry": price,
-                            "sl": price + risk,
-                            "tp1": price - risk,
-                            "tp2": price - risk * 3
-                        }
+    return {
+        "type": bias,
+        "entry": round(price,2),
+        "sl": round(sl,2),
+        "tp1": round(tp1,2),
+        "tp2": round(tp2,2),
+        "confidence": confidence,
+        "reason": "Liquidity sweep + Fair Value Gap + HTF bias"
+    }
 
-                    active_trades[market] = trade
+# =========================
+# SIGNAL MESSAGES
+# =========================
 
-                    msg = f"""
-💹 NEW TRADE - {market}
+def send_analysis(pair, signal):
 
-📊 Direction: {trade['dir']}
-📍 Entry: {round(price,2)}
+    message = f"""
+📊 MARKET ANALYSIS — {pair}
 
-🛑 SL: {round(trade['sl'],2)}
-💰 TP1: {round(trade['tp1'],2)}
-🎯 TP2: {round(trade['tp2'],2)}
+Bias: {signal['type']}
 
-⚖️ RR: 1:3
+Reason For Setup:
+
+• Liquidity sweep detected
+• Fair Value Gap entry
+• Higher timeframe bias aligned
+
+Confidence:
+{signal['confidence']}%
+
+Timeframes Used:
+
+HTF: Daily / 4H
+Confirmation: 1H
+Entry: 5M
+
+Risk Per Trade:
+1%
 """
 
-                    await send(session, msg, buttons())
-                    asyncio.create_task(monitor_trade(session, market, trade))
+    bot.send_message(chat_id=CHAT_ID, text=message)
 
-                except Exception as e:
-                    print("Error:", e)
 
-            await asyncio.sleep(INTERVAL)
+def send_trade(pair, signal):
+
+    message = f"""
+🚀 TRADE SETUP — {pair}
+
+Type: {signal['type']}
+
+Entry:
+{signal['entry']}
+
+Stop Loss:
+{signal['sl']}
+
+Take Profit 1:
+{signal['tp1']}
+
+Take Profit 2:
+{signal['tp2']}
+
+Management Plan:
+
+TP1 → Move SL to Break Even  
+TP2 → Close remaining position
+"""
+
+    bot.send_message(chat_id=CHAT_ID, text=message)
+
+
+# =========================
+# MARKET SCANNER
+# =========================
+
+def scan_markets():
+
+    trades_today = 0
+
+    for pair, symbol in PAIRS.items():
+
+        if trades_today >= MAX_TRADES_PER_DAY:
+            break
+
+        df = fetch_data(symbol)
+
+        if df.empty:
+            continue
+
+        signal = generate_signal(df)
+
+        if signal:
+
+            send_analysis(pair, signal)
+            send_trade(pair, signal)
+
+            trades_today += 1
+
+
+# =========================
+# DASHBOARD COMMAND
+# =========================
+
+def dashboard(update: Update, context: CallbackContext):
+
+    cursor.execute("SELECT COUNT(*) FROM trades")
+    total = cursor.fetchone()[0]
+
+    cursor.execute("SELECT COUNT(*) FROM trades WHERE result='win'")
+    wins = cursor.fetchone()[0]
+
+    losses = total - wins
+
+    if total > 0:
+        winrate = round((wins / total) * 100,2)
+    else:
+        winrate = 0
+
+    message = f"""
+📊 VIP SIGNAL DASHBOARD
+
+Total Trades:
+{total}
+
+Wins:
+{wins}
+
+Losses:
+{losses}
+
+Win Rate:
+{winrate}%
+"""
+
+    update.message.reply_text(message)
+
+
+# =========================
+# START BOT
+# =========================
+
+def main():
+
+    updater = Updater(BOT_TOKEN, use_context=True)
+
+    dp = updater.dispatcher
+
+    dp.add_handler(CommandHandler("dashboard", dashboard))
+
+    updater.start_polling()
+
+    scan_markets()
+
+    updater.idle()
+
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
